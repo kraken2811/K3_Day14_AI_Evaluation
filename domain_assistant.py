@@ -13,6 +13,8 @@ import math
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -21,8 +23,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
-
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -242,8 +242,166 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
+class GeminiGenerator:
+    def __init__(self, max_output_tokens: int = 300) -> None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("GEMINI_MODEL is missing from .env")
+        self.api_key = api_key
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        if self.model.startswith("gemini-3"):
+            return self._generate_interaction(prompt)
+        raw = self._generate_with_retries(prompt)
+        try:
+            result = json.loads(raw)
+            candidates = result.get("candidates", [])
+            if not candidates:
+                raise RuntimeError(f"Gemini returned no candidates: {raw}")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            answer = "".join(
+                part.get("text", "") for part in parts if isinstance(part, dict)
+            ).strip()
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Could not parse Gemini response: {raw}") from exc
+        if not answer:
+            raise RuntimeError(f"Gemini returned an empty answer: {raw}")
+        return answer
+
+    def _generate_interaction(self, prompt: str) -> str:
+        url = "https://generativelanguage.googleapis.com/v1beta/interactions"
+        payload = {
+            "model": self.model,
+            "input": prompt,
+            "system_instruction": (
+                "Answer concisely using only the supplied context. "
+                "Do not add unsupported facts."
+            ),
+        }
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": self.api_key,
+                "Api-Revision": "2026-05-20",
+            },
+        )
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    raw = response.read().decode("utf-8")
+                    return self._parse_interaction_response(raw)
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 429 and attempt < 3:
+                    time.sleep(self._retry_delay_seconds(body))
+                    continue
+                raise RuntimeError(
+                    f"Gemini Interactions API request failed with HTTP {exc.code}: {body}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise RuntimeError(
+                    f"Gemini Interactions API request failed: {exc.reason}"
+                ) from exc
+        raise RuntimeError("Gemini Interactions API request failed after retries")
+
+    @staticmethod
+    def _parse_interaction_response(raw: str) -> str:
+        try:
+            result = json.loads(raw)
+            outputs = result.get("outputs")
+            if isinstance(outputs, list):
+                text = "".join(
+                    output.get("text", "")
+                    for output in outputs
+                    if isinstance(output, dict)
+                ).strip()
+                if text:
+                    return text
+            steps = result.get("steps", [])
+            collected: list[str] = []
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                content = step.get("content", [])
+                if isinstance(content, list):
+                    collected.extend(
+                        part.get("text", "")
+                        for part in content
+                        if isinstance(part, dict)
+                    )
+                if isinstance(step.get("text"), str):
+                    collected.append(step["text"])
+            text = "".join(collected).strip()
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Could not parse Gemini interaction response: {raw}") from exc
+        if not text:
+            raise RuntimeError(f"Gemini interaction returned an empty answer: {raw}")
+        return text
+
+    def _generate_with_retries(self, prompt: str) -> str:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.model}:generateContent"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": self.max_output_tokens,
+            },
+        }
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": self.api_key,
+            },
+        )
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    return response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 429 and attempt < 3:
+                    time.sleep(self._retry_delay_seconds(body))
+                    continue
+                raise RuntimeError(
+                    f"Gemini API request failed with HTTP {exc.code}: {body}"
+                ) from exc
+            except urllib.error.URLError as exc:
+                raise RuntimeError(f"Gemini API request failed: {exc.reason}") from exc
+        raise RuntimeError("Gemini API request failed after retries")
+
+    @staticmethod
+    def _retry_delay_seconds(error_body: str) -> float:
+        try:
+            payload = json.loads(error_body)
+            details = payload.get("error", {}).get("details", [])
+            for detail in details:
+                retry_delay = detail.get("retryDelay")
+                if isinstance(retry_delay, str) and retry_delay.endswith("s"):
+                    return max(1.0, float(retry_delay[:-1]) + 2.0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return 60.0
+
+
 class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
+        from openai import OpenAI
+
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_MODEL", "").strip()
         if not api_key:
@@ -264,6 +422,15 @@ class OpenAIGenerator:
         if not answer:
             raise RuntimeError("OpenAI returned an empty answer")
         return answer
+
+
+def build_default_generator() -> TextGenerator:
+    provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+    if provider == "gemini":
+        return GeminiGenerator()
+    if provider == "openai":
+        return OpenAIGenerator()
+    raise RuntimeError("LLM_PROVIDER must be either 'gemini' or 'openai'")
 
 
 @dataclass(frozen=True)
@@ -299,7 +466,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else build_default_generator(),
             top_k,
         )
 
@@ -508,7 +675,7 @@ def main() -> int:
             json.dumps(artifact, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-    except (OSError, OpenAIError, TypeError, ValueError, RuntimeError) as exc:
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}")
         return 2
     print(f"Generated {len(artifact['answers'])} actual answers: {output}")
